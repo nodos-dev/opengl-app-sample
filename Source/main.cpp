@@ -12,7 +12,7 @@
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 
-// Nodos
+ // Nodos
 #include "CommonEvents_generated.h"
 #include <nosFlatBuffersCommon.h>
 #include <Nodos/AppAPI.h>
@@ -267,22 +267,30 @@ GLImportedTexture ImportTexture(nos::sys::vulkan::TTexture const& tex)
 		std::cerr << "Failed to create memory object" << std::endl;
 		return {};
 	}
-	assert(glGetError() == GL_NO_ERROR);
+	if (glGetError() != GL_NO_ERROR)
+	{
+		std::cerr << "Failed to create memory object" << std::endl;
+		glDeleteMemoryObjectsEXT(1, &memory);
+		return {};
+	}
 #if defined(_WIN32)
 	auto handle = PlatformDupeHandle(tex.external_memory.pid(), (HANDLE)tex.external_memory.handle());
 #else
 #error Unsupported platform
 #endif
 	glImportMemory(memory, tex.external_memory.allocation_size(), GL_HANDLE_TYPE, handle);
-	assert(glGetError() == GL_NO_ERROR);
 	GLuint image{};
-	assert(glGetError() == GL_NO_ERROR);
 	glCreateTextures(GL_TEXTURE_2D, 1, &image);
-	assert(glGetError() == GL_NO_ERROR);
 	auto format = VulkanToOpenGLFormat(tex.format);
 	assert(format != GL_NONE);
 	glTextureStorageMem2DEXT(image, 1, format, tex.width, tex.height, memory, tex.offset);
-	assert(glGetError() == GL_NO_ERROR);
+	if (glGetError() != GL_NO_ERROR)
+	{
+		std::cerr << "Failed to create texture" << std::endl;
+		glDeleteTextures(1, &image);
+		glDeleteMemoryObjectsEXT(1, &memory);
+		return {};
+	}
 	return { .Image = image, .Memory = memory };
 }
 
@@ -296,6 +304,12 @@ GLuint ImportSemaphore(uint64_t pid, uint64_t handle)
 #error Unsupported platform
 #endif
 	glImportSemaphore(semaphore, GL_HANDLE_TYPE, semaphoreHandle);
+	if (glGetError() != GL_NO_ERROR || !glIsSemaphoreEXT(semaphore))
+	{
+		std::cerr << "Failed to import semaphore" << std::endl;
+		glDeleteSemaphoresEXT(1, &semaphore);
+		return 0;
+	}
 	return semaphore;
 }
 
@@ -313,15 +327,17 @@ struct ExternalTexture
 struct NodosState
 {
 	GLuint InputSemaphore = 0, OutputSemaphore = 0;
+	HANDLE RenderSubmittedEvent = 0;
 	ExternalTexture ShaderInput{}, ShaderOutput{};
 	nos::app::ExecutionState ExecutionState = nos::app::ExecutionState::IDLE;
-	std::uint64_t NodosFrameNumber = 0;
+	nos::app::ExecutionState ExecutionStateMainThread = nos::app::ExecutionState::IDLE;
+	std::optional<uint64_t> NodosFrameNumber = std::nullopt;
 	// Protects execution state and frame number
 	std::mutex ExecutionStateMutex;
 	std::condition_variable ExecutionStateCV;
 
 	std::uint64_t CurFrameNumber = 0;
-} NodosState;
+} g_NodosState;
 
 struct GLData
 {
@@ -367,7 +383,55 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 	nos::app::IAppServiceClient* Client;
 	nos::fb::UUID NodeId{};
 
-	void OnAppConnected(const nos::fb::Node* appNode) override
+	void HandleEvent(const nos::app::EngineEvent* event)
+	{
+		using namespace nos::app;
+		switch (event->event_type())
+		{
+		case EngineEventUnion::AppConnectedEvent: {
+			OnAppConnected(event->event_as<AppConnectedEvent>()->node());
+			break;
+		}
+		case EngineEventUnion::FullNodeUpdate: {
+			OnNodeUpdated(*event->event_as<nos::FullNodeUpdate>()->node());
+			break;
+		}
+		case EngineEventUnion::NodeRemovedEvent: {
+			OnNodeRemoved();
+			break;
+		}
+		case EngineEventUnion::AppPinValueChanged: {
+			auto const& pinValueChanged = event->event_as<AppPinValueChanged>();
+			OnPinValueChanged(*pinValueChanged->pin_id(),
+				pinValueChanged->value()->Data(),
+				pinValueChanged->value()->size(),
+				pinValueChanged->reset(),
+				pinValueChanged->frame_number());
+			break;
+		}
+		case EngineEventUnion::NodeImported: {
+			OnNodeImported(*event->event_as<nos::app::NodeImported>()->node());
+			break;
+		}
+
+		case EngineEventUnion::StateChanged: {
+			OnStateChanged(event->event_as<nos::app::StateChanged>()->state());
+			break;
+		}
+		case EngineEventUnion::AppExecuteStart: {
+			OnExecuteStart(event->event_as<nos::app::AppExecuteStart>());
+			break;
+		}
+		case EngineEventUnion::SyncSemaphoresFromNodos: {
+			OnSyncSemaphoresFromNodos(event->event_as<nos::app::SyncSemaphoresFromNodos>());
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	void OnAppConnected(const nos::fb::Node* appNode)
 	{
 		std::cout << "Connected to Nodos" << std::endl;
 		if (appNode)
@@ -376,16 +440,16 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 			CreateTexturePinsInNodos(*appNode);
 		}
 	}
-	void OnNodeUpdated(nos::fb::Node const& appNode) override 
+	void OnNodeUpdated(nos::fb::Node const& appNode)
 	{
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
 
 		CreateTexturePinsInNodos(appNode);
-		
+
 	}
 
-	void OnNodeImported(nos::fb::Node const& appNode) override 
+	void OnNodeImported(nos::fb::Node const& appNode)
 	{
 		std::cout << "Node updated from Nodos" << std::endl;
 		NodeId = *appNode.id();
@@ -393,17 +457,15 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		CreateTexturePinsInNodos(appNode);
 	}
 
-	void OnContextMenuRequested(nos::app::AppContextMenuRequest const& request) override {}
-	void OnContextMenuCommandFired(nos::app::AppContextMenuAction const& action) override {}
-	void OnNodeRemoved() override 
+	void OnNodeRemoved()
 	{
 		std::cout << "Node removed from Nodos" << std::endl;
 		TaskQueue.Push([]()
-		{
-			ResetState();
-		});
+			{
+				ResetState();
+			});
 	}
-	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber) override
+	void OnPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset, uint64_t frameNumber)
 	{
 		auto texRoot = flatbuffers::GetRoot<nos::sys::vulkan::Texture>(data);
 		if (!texRoot)
@@ -417,28 +479,24 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		TaskQueue.Push([pinId, tex = std::move(tex)]()
 			{
 				std::cout << "Pin value changed" << std::endl;
-				if (pinId == NodosState.ShaderInput.Id || pinId == NodosState.ShaderOutput.Id)
+				if (pinId == g_NodosState.ShaderInput.Id || pinId == g_NodosState.ShaderOutput.Id)
 				{
 					auto imported = ImportTexture(tex);
-					if (pinId == NodosState.ShaderInput.Id)
+					if (pinId == g_NodosState.ShaderInput.Id)
 					{
-						NodosState.ShaderInput.Texture = tex;
-						NodosState.ShaderInput.Image = imported;
+						g_NodosState.ShaderInput.Texture = tex;
+						g_NodosState.ShaderInput.Image = imported;
 					}
-					else if (pinId == NodosState.ShaderOutput.Id)
+					else if (pinId == g_NodosState.ShaderOutput.Id)
 					{
-						NodosState.ShaderOutput.Texture = tex;
-						NodosState.ShaderOutput.Image = imported;
-						glNamedFramebufferTexture(glData.FBO, GL_COLOR_ATTACHMENT0, NodosState.ShaderOutput.Image.Image, 0);
+						g_NodosState.ShaderOutput.Texture = tex;
+						g_NodosState.ShaderOutput.Image = imported;
+						glNamedFramebufferTexture(glData.FBO, GL_COLOR_ATTACHMENT0, g_NodosState.ShaderOutput.Image.Image, 0);
 					}
 				}
 			});
 	}
-	void OnPinShowAsChanged(nos::fb::UUID const& pinId, nos::fb::ShowAs newShowAs) override {}
-	void OnExecuteAppInfo(nos::app::AppExecuteInfo const* appExecuteInfo) override {}
-	void OnFunctionCall(nos::app::FunctionCall const* functionCall) override {}
-	void OnNodeSelected(nos::fb::UUID const& nodeId) override {}
-	void OnConnectionClosed() override 
+	void OnConnectionClosed() override
 	{
 		UpdateSyncState(nos::app::ExecutionState::IDLE);
 		std::cout << "Connection to Nodos closed" << std::endl;
@@ -447,11 +505,12 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 				ResetState();
 			});
 	}
-	void OnStateChanged(nos::app::ExecutionState newState) override
+	void OnStateChanged(nos::app::ExecutionState newState)
 	{
 		UpdateSyncState(newState);
 		TaskQueue.Push([newState]()
 			{
+				g_NodosState.ExecutionStateMainThread = newState;
 				if (newState == nos::app::ExecutionState::SYNCED)
 				{
 					flatbuffers::FlatBufferBuilder mb;
@@ -467,24 +526,28 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 				}
 			});
 	}
-	void OnConsoleCommand(nos::app::ConsoleCommand const* consoleCommand) override {}
-	void OnConsoleAutoCompleteSuggestionRequest(nos::app::ConsoleAutoCompleteSuggestionRequest const* consoleAutoCompleteSuggestionRequest) override {}
-	void OnLoadNodesOnPaths(nos::app::LoadNodesOnPaths const* loadNodesOnPathsRequest) override {}
-	void OnCloseApp() override {}
-	void OnExecuteStart(nos::app::AppExecuteStart const* appExecuteStart) override 
+	void OnExecuteStart(nos::app::AppExecuteStart const* appExecuteStart)
 	{
 		{
-			std::unique_lock<std::mutex> lock(NodosState.ExecutionStateMutex);
-			NodosState.NodosFrameNumber = appExecuteStart->frame_counter();
+			std::unique_lock<std::mutex> lock(g_NodosState.ExecutionStateMutex);
+			//std::cout << "Execution started:" << appExecuteStart->frame_counter() << std::endl;
+			if (appExecuteStart->reset())
+				g_NodosState.NodosFrameNumber = std::nullopt;
+			else
+				g_NodosState.NodosFrameNumber = appExecuteStart->frame_counter();
 		}
-		NodosState.ExecutionStateCV.notify_all();
+		g_NodosState.ExecutionStateCV.notify_all();
 	}
 	void OnSyncSemaphoresFromNodos(nos::app::SyncSemaphoresFromNodos const* syncSemaphoresFromNodos)
 	{
-		TaskQueue.Push([syncSemaphoresFromNodos]()
+		TaskQueue.Push([pid = syncSemaphoresFromNodos->pid(), inputSemaphoreHandle = syncSemaphoresFromNodos->input_semaphore(),
+			outputSemaphoreHandle = syncSemaphoresFromNodos->output_semaphore(),
+			renderSubmittedEvent = syncSemaphoresFromNodos->process_render_submitted_event()]()
 			{
-				//NodosState.InputSemaphore = ImportSemaphore(syncSemaphoresFromNodos->pid(), syncSemaphoresFromNodos->input_semaphore());
-				//NodosState.OutputSemaphore = ImportSemaphore(syncSemaphoresFromNodos->pid(), syncSemaphoresFromNodos->output_semaphore());
+				DeleteSyncSemaphores();
+				g_NodosState.InputSemaphore = ImportSemaphore(pid, inputSemaphoreHandle);
+				g_NodosState.OutputSemaphore = ImportSemaphore(pid, outputSemaphoreHandle);
+				g_NodosState.RenderSubmittedEvent = PlatformDupeHandle(pid, (HANDLE)renderSubmittedEvent);
 			});
 	}
 };
@@ -514,7 +577,7 @@ void APIENTRY debug_message_callback(GLenum source, GLenum type, GLuint id, GLen
 	switch (severity)
 	{
 	case GL_DEBUG_SEVERITY_HIGH:
-		std::cerr << "OpenGL: " <<  message << std::endl;
+		std::cerr << "OpenGL: " << message << std::endl;
 		break;
 	case GL_DEBUG_SEVERITY_MEDIUM:
 		std::cerr << "OpenGL: " << message << std::endl;
@@ -531,14 +594,14 @@ void APIENTRY debug_message_callback(GLenum source, GLenum type, GLuint id, GLen
 
 bool InitWindow()
 {
-    glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+	glfwInit();
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 5);
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
 
-    window = glfwCreateWindow(WIDTH, HEIGHT, "OpenGLAppSample", nullptr, nullptr);
-	if(!window)
+	window = glfwCreateWindow(WIDTH, HEIGHT, "OpenGLAppSample", nullptr, nullptr);
+	if (!window)
 	{
 		std::cout << "Failed to create GLFW window" << std::endl;
 		glfwTerminate();
@@ -577,6 +640,7 @@ bool InitWindow()
 #else
 #error Unsupported platform
 #endif
+	glfwSwapInterval(0);
 	return true;
 }
 
@@ -608,7 +672,7 @@ GLuint CreateShaderProgram(const char* vertexShaderSource, const char* fragmentS
 				return 0;
 			}
 			return shader;
-		};
+};
 	GLuint shaderProgram = glCreateProgram();
 	auto vertexShader = compileShader(vertexShaderSource, GL_VERTEX_SHADER);
 	auto fragmentShader = compileShader(fragmentShaderSource, GL_FRAGMENT_SHADER);
@@ -633,12 +697,12 @@ void InitOpenGL()
 	glCreateVertexArrays(1, &glData.VAO);
 	// position & texture coordinates
 	float vertices[] = {
-	  //bottom left
-	  -1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
-	  //bottom right
-		1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
-		//top
-		0.0f, 1.0f, 0.0f, 0.5f, 1.0f
+		//bottom left
+		-1.0f, -1.0f, 0.0f, 0.0f, 0.0f,
+		//bottom right
+		  1.0f, -1.0f, 0.0f, 1.0f, 0.0f,
+		  //top
+		  0.0f, 1.0f, 0.0f, 0.5f, 1.0f
 	};
 	glCreateBuffers(1, &glData.VBO);
 	glNamedBufferStorage(glData.VBO, sizeof(vertices), vertices, 0);
@@ -646,7 +710,7 @@ void InitOpenGL()
 	GLuint vaoBindingPoint = 0;
 	glVertexArrayVertexBuffer(glData.VBO, 0, glData.VBO,
 		0,                  // offset of the first element in the buffer hctVBO.
-		5*sizeof(float));   // stride == 3 position floats + 2 texture coordinate floats
+		5 * sizeof(float));   // stride == 3 position floats + 2 texture coordinate floats
 
 	GLuint attribPos = 0;
 	GLuint attribTexCoord = 1;
@@ -654,7 +718,7 @@ void InitOpenGL()
 	glEnableVertexArrayAttrib(glData.VAO, attribTexCoord);
 
 	glVertexArrayAttribFormat(glData.VAO, attribPos, 3, GL_FLOAT, GL_FALSE, 0);
-	glVertexArrayAttribFormat(glData.VAO, attribTexCoord, 2, GL_FLOAT, GL_FALSE, 3*sizeof(float));
+	glVertexArrayAttribFormat(glData.VAO, attribTexCoord, 2, GL_FLOAT, GL_FALSE, 3 * sizeof(float));
 
 	glVertexArrayAttribBinding(glData.VAO, attribPos, vaoBindingPoint);
 	glVertexArrayAttribBinding(glData.VAO, attribTexCoord, vaoBindingPoint);
@@ -716,10 +780,10 @@ int InitNosSDK()
 		return -1;
 	}
 
-	client = pfnMakeAppServiceClient("localhost:50053", nos::app::ApplicationInfo{ 
+	client = pfnMakeAppServiceClient("localhost:50053", nos::app::ApplicationInfo{
 		.AppKey = "Sample-OpenGL-App",
 		.AppName = "Sample OpenGL App"
-	});
+		});
 
 	if (!client) {
 		std::cerr << "Failed to create App Service Client" << std::endl;
@@ -744,19 +808,19 @@ void CreateTexturePinsInNodos(const nos::fb::Node& appNode)
 	flatbuffers::FlatBufferBuilder fbb;
 	if (createPins)
 	{
-		NodosState.ShaderInput.Id = GenerateRandomUUID();
-		pins.push_back(nos::fb::CreatePinDirect(fbb, &NodosState.ShaderInput.Id, "Shader Input", nos::sys::vulkan::Texture::GetFullyQualifiedName(), nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
-		NodosState.ShaderOutput.Id = GenerateRandomUUID();
-		pins.push_back(nos::fb::CreatePinDirect(fbb, &NodosState.ShaderOutput.Id, "Shader Output", nos::sys::vulkan::Texture::GetFullyQualifiedName(), nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
+		g_NodosState.ShaderInput.Id = GenerateRandomUUID();
+		pins.push_back(nos::fb::CreatePinDirect(fbb, &g_NodosState.ShaderInput.Id, "Shader Input", nos::sys::vulkan::Texture::GetFullyQualifiedName(), nos::fb::ShowAs::INPUT_PIN, nos::fb::CanShowAs::INPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Input"));
+		g_NodosState.ShaderOutput.Id = GenerateRandomUUID();
+		pins.push_back(nos::fb::CreatePinDirect(fbb, &g_NodosState.ShaderOutput.Id, "Shader Output", nos::sys::vulkan::Texture::GetFullyQualifiedName(), nos::fb::ShowAs::OUTPUT_PIN, nos::fb::CanShowAs::OUTPUT_PIN_ONLY, "Shader Vars", 0, 0, 0, 0, 0, 0, 0, false, false, false, 0, 0, nos::fb::PinContents::JobPin, 0, 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, "Example tooltip", "Texture Output"));
 	}
 	else
 	{
 		for (auto pin : *appNode.pins())
 		{
 			if (pin->show_as() == nos::fb::ShowAs::INPUT_PIN)
-				NodosState.ShaderInput.Id = *pin->id();
+				g_NodosState.ShaderInput.Id = *pin->id();
 			else if (pin->show_as() == nos::fb::ShowAs::OUTPUT_PIN)
-				NodosState.ShaderOutput.Id = *pin->id();
+				g_NodosState.ShaderOutput.Id = *pin->id();
 		}
 	}
 
@@ -769,51 +833,61 @@ void CreateTexturePinsInNodos(const nos::fb::Node& appNode)
 
 void UpdateSyncState(nos::app::ExecutionState newState)
 {
-	std::unique_lock<std::mutex> lock(NodosState.ExecutionStateMutex);
-	NodosState.ExecutionState = newState;
-	NodosState.ExecutionStateCV.notify_all();
+	std::unique_lock<std::mutex> lock(g_NodosState.ExecutionStateMutex);
+	g_NodosState.ExecutionState = newState;
+	g_NodosState.ExecutionStateCV.notify_all();
 }
 
 void DeleteSyncSemaphores()
 {
-	if (NodosState.InputSemaphore)
+	if (g_NodosState.InputSemaphore)
 	{
-		glDeleteSemaphoresEXT(1, &NodosState.InputSemaphore);
-		NodosState.InputSemaphore = 0;
+		glDeleteSemaphoresEXT(1, &g_NodosState.InputSemaphore);
+		g_NodosState.InputSemaphore = 0;
 	}
-	if (NodosState.OutputSemaphore)
+	if (g_NodosState.OutputSemaphore)
 	{
-		glDeleteSemaphoresEXT(1, &NodosState.OutputSemaphore);
-		NodosState.OutputSemaphore = 0;
+		glDeleteSemaphoresEXT(1, &g_NodosState.OutputSemaphore);
+		g_NodosState.OutputSemaphore = 0;
 	}
+	if (g_NodosState.RenderSubmittedEvent)
+	{
+		SetEvent(g_NodosState.RenderSubmittedEvent);
+		CloseHandle(g_NodosState.RenderSubmittedEvent);
+		g_NodosState.RenderSubmittedEvent = 0;
+	}
+	g_NodosState.CurFrameNumber = 0;
 }
 
 void ResetState()
 {
-	if (NodosState.ShaderInput.Image.Image)
+	if (g_NodosState.ShaderInput.Image.Image)
 	{
-		glDeleteTextures(1, &NodosState.ShaderInput.Image.Image);
-		glDeleteMemoryObjectsEXT(1, &NodosState.ShaderInput.Image.Memory);
+		glDeleteTextures(1, &g_NodosState.ShaderInput.Image.Image);
+		glDeleteMemoryObjectsEXT(1, &g_NodosState.ShaderInput.Image.Memory);
 	}
-	if (NodosState.ShaderOutput.Image.Image)
+	if (g_NodosState.ShaderOutput.Image.Image)
 	{
-		glDeleteTextures(1, &NodosState.ShaderOutput.Image.Image);
-		glDeleteMemoryObjectsEXT(1, &NodosState.ShaderOutput.Image.Memory);
+		glDeleteTextures(1, &g_NodosState.ShaderOutput.Image.Image);
+		glDeleteMemoryObjectsEXT(1, &g_NodosState.ShaderOutput.Image.Memory);
 	}
 	DeleteSyncSemaphores();
-	NodosState.ShaderInput = {};
-	NodosState.ShaderOutput = {};
-	std::unique_lock lock(NodosState.ExecutionStateMutex);
-	NodosState.NodosFrameNumber = 0;
-	NodosState.ExecutionState = nos::app::ExecutionState::IDLE;
+	g_NodosState.ShaderInput = {};
+	g_NodosState.ShaderOutput = {};
+	g_NodosState.CurFrameNumber = 0;
+	std::unique_lock lock(g_NodosState.ExecutionStateMutex);
+	g_NodosState.NodosFrameNumber = std::nullopt;
+	g_NodosState.ExecutionState = nos::app::ExecutionState::IDLE;
+	g_NodosState.ExecutionStateMainThread = nos::app::ExecutionState::IDLE;
 }
 
-int main() 
+int main()
 {
 	InitWindow();
 	InitOpenGL();
 	InitNosSDK();
-	
+
+
 	GLuint testTexture;
 	glCreateTextures(GL_TEXTURE_2D, 1, &testTexture);
 	glTextureStorage2D(testTexture, 1, GL_RGBA16F, 1920, 1080);
@@ -824,71 +898,81 @@ int main()
 
 	int frame = 0;
 	while (!glfwWindowShouldClose(window)) {
-        glfwPollEvents();
+		glfwPollEvents();
 		TaskQueue.Process();
 		if (!client->IsConnected())
 		{
 			std::cout << "Reconnecting to Nodos..." << std::endl;
-			while (!client->TryConnect())
+			while (!client->TryConnect() || !client->IsConnected())
 			{
 				std::this_thread::sleep_for(std::chrono::seconds(1));
 			}
 		}
 
-		{
-			std::unique_lock<std::mutex> lock(NodosState.ExecutionStateMutex);
-			if (NodosState.ExecutionState == nos::app::ExecutionState::SYNCED)
-			{
-				if (NodosState.NodosFrameNumber <= NodosState.CurFrameNumber)
-					NodosState.ExecutionStateCV.wait(lock, [&]() { return NodosState.NodosFrameNumber > NodosState.CurFrameNumber || NodosState.ExecutionState != nos::app::ExecutionState::IDLE; });
-			}
-		}
-
 		glClearColor(0.0f, 0.3f, 0.3f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
-
-		uint32_t imageIndex; 
-		bool areTexturesReady = NodosState.ShaderInput.Image.Image && NodosState.ShaderOutput.Image.Image;
-		bool areSemaphoresReady = NodosState.InputSemaphore && NodosState.OutputSemaphore;
-		if (areTexturesReady)
+		bool areTexturesReady = g_NodosState.ShaderInput.Image.Image && g_NodosState.ShaderOutput.Image.Image;
+		bool areSemaphoresReady = g_NodosState.InputSemaphore && g_NodosState.OutputSemaphore;
+		if (g_NodosState.ExecutionStateMainThread == nos::app::ExecutionState::SYNCED && areTexturesReady && areSemaphoresReady)
 		{
-			//wait for input semaphore
-			if(areSemaphoresReady)
+			bool isIdle = false;
 			{
-				GLenum srcLayout = GL_LAYOUT_TRANSFER_DST_EXT;
-				glWaitSemaphoreEXT(NodosState.InputSemaphore, 0, nullptr, 1, &NodosState.ShaderInput.Image.Image, &srcLayout);
+				std::unique_lock<std::mutex> lock(g_NodosState.ExecutionStateMutex);
+				if (!g_NodosState.NodosFrameNumber || *g_NodosState.NodosFrameNumber < g_NodosState.CurFrameNumber)
+				{
+					//std::cout << "Waiting for Nodos to signal execution:" << g_NodosState.CurFrameNumber << std::endl;
+					g_NodosState.ExecutionStateCV.wait(lock, [&]() { return g_NodosState.NodosFrameNumber && *g_NodosState.NodosFrameNumber >= g_NodosState.CurFrameNumber || g_NodosState.ExecutionState == nos::app::ExecutionState::IDLE; });
+					isIdle = g_NodosState.ExecutionState == nos::app::ExecutionState::IDLE;
+				}
 			}
-			//render to texture
-			glBindFramebuffer(GL_FRAMEBUFFER, glData.FBO);
-			glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
-			glViewport(0, 0, NodosState.ShaderOutput.Texture.width, NodosState.ShaderOutput.Texture.height);
-			glUseProgram(glData.ShaderProgram);
-			glBindVertexArray(glData.VAO);
-			glBindBuffer(GL_ARRAY_BUFFER, glData.VBO);
-			glBindTextureUnit(0, NodosState.ShaderInput.Image.Image);
-			glUniform1i(glGetUniformLocation(glData.ShaderProgram, "inTexture"), 0);
-			glDrawArrays(GL_TRIANGLES, 0, 3);
-			glBindVertexArray(0);
-			glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
-			//signal output semaphore
-			if (areSemaphoresReady)
+			if (!isIdle)
 			{
-				GLenum dstLayouts = GL_LAYOUT_TRANSFER_SRC_EXT;
-				glSignalSemaphoreEXT(NodosState.OutputSemaphore, 0, nullptr, 1, &NodosState.ShaderOutput.Image.Image, &dstLayouts);
-				glFlush();
+				uint32_t imageIndex;
+				//wait for input semaphore
+				{
+					GLenum srcLayout = GL_LAYOUT_TRANSFER_DST_EXT;
+					//std::cout << "Waiting for input semaphore" << std::endl;
+					glWaitSemaphoreEXT(g_NodosState.InputSemaphore, 0, nullptr, 1, &g_NodosState.ShaderInput.Image.Image, &srcLayout);
+					glFlush();
+					if (glGetError() != GL_NO_ERROR)
+					{
+						std::cerr << "Failed to wait for input semaphore" << std::endl;
+						continue;
+					}
+				}
+				//render to texture
+				glBindFramebuffer(GL_FRAMEBUFFER, glData.FBO);
+				glClipControl(GL_UPPER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+				glViewport(0, 0, g_NodosState.ShaderOutput.Texture.width, g_NodosState.ShaderOutput.Texture.height);
+				glUseProgram(glData.ShaderProgram);
+				glBindVertexArray(glData.VAO);
+				glBindBuffer(GL_ARRAY_BUFFER, glData.VBO);
+				glBindTextureUnit(0, g_NodosState.ShaderInput.Image.Image);
+				glUniform1i(glGetUniformLocation(glData.ShaderProgram, "inTexture"), 0);
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+				glBindVertexArray(0);
+				//signal output semaphore
+				{
+					GLenum dstLayouts = GL_LAYOUT_TRANSFER_SRC_EXT;
+					glSignalSemaphoreEXT(g_NodosState.OutputSemaphore, 0, nullptr, 1, &g_NodosState.ShaderOutput.Image.Image, &dstLayouts);
+					glFlush();
+					SetEvent(g_NodosState.RenderSubmittedEvent);
+				}
+				glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
+				//render to screen
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, glData.FBO);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+				glBlitFramebuffer(0, 0, g_NodosState.ShaderOutput.Texture.width, g_NodosState.ShaderOutput.Texture.height, 0, 0, WIDTH, HEIGHT, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+				g_NodosState.CurFrameNumber++;
 			}
-			//render to screen
-			glBindFramebuffer(GL_READ_FRAMEBUFFER, glData.FBO);
-			glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-			glBlitFramebuffer(0, 0, NodosState.ShaderOutput.Texture.width, NodosState.ShaderOutput.Texture.height, 0, 0, WIDTH, HEIGHT, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 		}
-		NodosState.CurFrameNumber++;
 		glfwSwapBuffers(window);
-    }
+	}
 
-
+	ResetState();
 	glfwDestroyWindow(window);
-    glfwTerminate();
+	glfwTerminate();
 
 	return 0;
 }
