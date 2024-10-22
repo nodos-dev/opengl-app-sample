@@ -18,17 +18,18 @@
 #include <Nodos/AppAPI.h>
 #include "nosVulkanSubsystem/nosVulkanSubsystem.h"
 
+#if defined(_WIN32)
 #define NOMINMAX 1
 #define WIN32_LEAN_AND_MEAN 1
 #include "Windows.h"
-
-#ifdef WIN32
 #	define glImportSemaphore glImportSemaphoreWin32HandleEXT
 #	define glImportMemory glImportMemoryWin32HandleEXT
 #	define GL_HANDLE_TYPE GL_HANDLE_TYPE_OPAQUE_WIN32_EXT
 #	define VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT
 #	define VK_EXTERNAL_MEMORY_HANDLE_TYPE VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
 #else
+#include <dlfcn.h>
+#include <sys/eventfd.h>
 #	define glImportSemaphore glImportSemaphoreFdEXT
 #	define glImportMemory glImportMemoryFdEXT
 #	define GL_HANDLE_TYPE GL_HANDLE_TYPE_OPAQUE_FD_EXT
@@ -37,79 +38,107 @@
 GLFWwindow* window;
 const uint32_t WIDTH = 1920;
 const uint32_t HEIGHT = 1080;
-
+nos::app::IAppServiceClient* client;
+struct SampleEventDelegates* eventDelegates;
 
 void CreateTexturePinsInNodos(const nos::fb::Node& appNode);
 
-#if defined(_WIN32)
-#define WIN32_ASSERT(expr)                                                                                        \
-    if (!(expr))                                                                                                  \
-    {                                                                                                             \
-        char errbuf[1024];                                                                                        \
-        std::snprintf(errbuf, 1024, "%s\t(%s:%d)", GetLastErrorAsString().c_str(), __FILE__, __LINE__); \
-		assert(false);                                                                                            \
-    }
-
-std::string GetLastErrorAsString()
+struct ImportedOSHandle
 {
-	// Get the error message ID, if any.
-	DWORD errorMessageID = GetLastError();
-	if (errorMessageID == 0)
+	std::optional<NOS_HANDLE> OSHandle = std::nullopt;
+	ImportedOSHandle(ImportedOSHandle const& other) = delete;
+	ImportedOSHandle& operator=(ImportedOSHandle const& other) = delete;
+	ImportedOSHandle(ImportedOSHandle&& other) noexcept : OSHandle(std::move(other.OSHandle)) {
+		other.OSHandle = std::nullopt;
+	}
+	ImportedOSHandle& operator=(ImportedOSHandle&& other) noexcept
 	{
-		return std::string(); // No error message has been recorded
+		CloseHandle();
+		OSHandle = std::move(other.OSHandle);
+		other.OSHandle = std::nullopt;
+		return *this;
+	}
+	ImportedOSHandle() : OSHandle(std::nullopt) {}
+	ImportedOSHandle(NOS_HANDLE fromHandle) : OSHandle(client->DuplicateHandle(fromHandle)) {}
+	~ImportedOSHandle()
+	{
+		CloseHandle();
+	}
+	void CloseHandle()
+	{
+		if (OSHandle)
+			client->CloseHandle(*OSHandle);
 	}
 
-	LPSTR messageBuffer = nullptr;
-
-	// Ask Win32 to give us the string version of that message ID.
-	// The parameters we pass in, tell Win32 to create the buffer that holds the message for us (because we don't yet know how long the message string will be).
-	size_t size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-		NULL,
-		errorMessageID,
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPSTR)&messageBuffer,
-		0,
-		NULL);
-
-	// Copy the error message into a std::string.
-	std::string message(messageBuffer, size);
-
-	// Free the Win32's string's buffer.
-	LocalFree(messageBuffer);
-
-	return message;
-}
-
-HANDLE PlatformDupeHandle(u64 pid, HANDLE handle)
-{
-	DWORD flags;
-	HANDLE re = 0;
-
-	HANDLE cur = GetCurrentProcess();
-	HANDLE src = pid ? OpenProcess(GENERIC_ALL, false, pid) : cur;
-
-	if (!DuplicateHandle(src, handle, cur, &re, GENERIC_ALL, 0, DUPLICATE_SAME_ACCESS))
-		return 0;
-
-
-	WIN32_ASSERT(GetHandleInformation(src, &flags));
-	WIN32_ASSERT(GetHandleInformation(cur, &flags));
-	WIN32_ASSERT(GetHandleInformation(re, &flags));
-
-	WIN32_ASSERT(CloseHandle(src));
-
-	return re;
-}
-#else
-#error Unsupported platform
-#endif
-
-
+	operator NOS_HANDLE() const
+	{
+		return OSHandle.value_or(0);
+	}
+};
 
 struct GLImportedTexture
 {
-	GLuint Image;
-	GLuint Memory;
+	ImportedOSHandle OSHandle {};
+	GLuint Image{};
+	GLuint Memory{};
+	GLImportedTexture() {}
+	GLImportedTexture(ImportedOSHandle osHandle, GLuint image, GLuint memory) : OSHandle(std::move(osHandle)), Image(image), Memory(memory) {}
+	GLImportedTexture(GLImportedTexture&& other) 
+	{
+		Image = other.Image;
+		Memory = other.Memory;
+		OSHandle = std::move(other.OSHandle);
+		other.Image = 0;
+		other.Memory = 0;
+	}
+	GLImportedTexture& operator=(GLImportedTexture&& other) {
+		if (Image)
+			glDeleteTextures(1, &Image);
+		if (Memory)
+			glDeleteMemoryObjectsEXT(1, &Memory);
+		Image = other.Image;
+		Memory = other.Memory;
+		OSHandle = std::move(other.OSHandle);
+		other.Image = 0;
+		other.Memory = 0;
+		return *this;
+	}
+	~GLImportedTexture()
+	{
+		if (Image)
+			glDeleteTextures(1, &Image);
+		if (Memory)
+			glDeleteMemoryObjectsEXT(1, &Memory);
+	}
+};
+
+struct GLImportedSemaphore
+{
+	ImportedOSHandle OSHandle{};
+	GLuint Semaphore{};
+
+	GLImportedSemaphore() {}
+	GLImportedSemaphore(ImportedOSHandle osHandle, GLuint semaphore) : OSHandle(std::move(osHandle)), Semaphore(Semaphore) {}
+	GLImportedSemaphore(GLImportedSemaphore&& other) 
+	{
+		Semaphore = other.Semaphore;
+		OSHandle = std::move(other.OSHandle);
+		other.Semaphore = 0;
+	}
+	GLImportedSemaphore& operator=(GLImportedSemaphore&& other) 
+	{
+		if (Semaphore)
+			glDeleteSemaphoresEXT(1, &Semaphore);
+		Semaphore = other.Semaphore;
+		OSHandle = std::move(other.OSHandle);
+		other.Semaphore = 0;
+		return *this;
+	}
+	~GLImportedSemaphore()
+	{
+		if (Semaphore)
+			glDeleteSemaphoresEXT(1, &Semaphore);
+	}
 };
 
 GLenum VulkanToOpenGLFormat(nos::sys::vulkan::Format format)
@@ -258,59 +287,51 @@ GLenum VulkanToOpenGLFormat(nos::sys::vulkan::Format format)
 	}
 }
 
-GLImportedTexture ImportTexture(nos::sys::vulkan::TTexture const& tex)
+std::optional<GLImportedTexture> ImportTexture(nos::sys::vulkan::TTexture const& tex)
 {
-	GLuint memory{};
-	glCreateMemoryObjectsEXT(1, &memory);
-	if (!glIsMemoryObjectEXT(memory))
+	GLImportedTexture imported{};
+	glCreateMemoryObjectsEXT(1, &imported.Memory);
+	if (!glIsMemoryObjectEXT(imported.Memory))
 	{
 		std::cerr << "Failed to create memory object" << std::endl;
-		return {};
+		return std::nullopt;
 	}
 	if (glGetError() != GL_NO_ERROR)
 	{
 		std::cerr << "Failed to create memory object" << std::endl;
-		glDeleteMemoryObjectsEXT(1, &memory);
-		return {};
+		return std::nullopt;
 	}
-#if defined(_WIN32)
-	auto handle = PlatformDupeHandle(tex.external_memory.pid(), (HANDLE)tex.external_memory.handle());
-#else
-#error Unsupported platform
-#endif
-	glImportMemory(memory, tex.external_memory.allocation_size(), GL_HANDLE_TYPE, handle);
-	GLuint image{};
-	glCreateTextures(GL_TEXTURE_2D, 1, &image);
+	auto handle = ImportedOSHandle(tex.external_memory.handle());
+	if(!handle.OSHandle)
+	{
+		std::cerr << "Failed to duplicate handle" << std::endl;
+		return std::nullopt;
+	}
+	glImportMemory(imported.Memory, tex.external_memory.allocation_size(), GL_HANDLE_TYPE, handle.OSHandle.value_or(0));
+	glCreateTextures(GL_TEXTURE_2D, 1, &imported.Image);
 	auto format = VulkanToOpenGLFormat(tex.format);
 	assert(format != GL_NONE);
-	glTextureStorageMem2DEXT(image, 1, format, tex.width, tex.height, memory, tex.offset);
+	glTextureStorageMem2DEXT(imported.Image, 1, format, tex.width, tex.height, imported.Memory, tex.offset);
 	if (glGetError() != GL_NO_ERROR)
 	{
 		std::cerr << "Failed to create texture" << std::endl;
-		glDeleteTextures(1, &image);
-		glDeleteMemoryObjectsEXT(1, &memory);
 		return {};
 	}
-	return { .Image = image, .Memory = memory };
+	return imported;
 }
 
-GLuint ImportSemaphore(uint64_t pid, uint64_t handle)
+std::optional<GLImportedSemaphore> ImportSemaphore(uint64_t pid, uint64_t handle)
 {
-	GLuint semaphore;
-	glGenSemaphoresEXT(1, &semaphore);
-#if defined(_WIN32)
-	auto semaphoreHandle = PlatformDupeHandle(pid, (HANDLE)handle);
-#else
-#error Unsupported platform
-#endif
-	glImportSemaphore(semaphore, GL_HANDLE_TYPE, semaphoreHandle);
-	if (glGetError() != GL_NO_ERROR || !glIsSemaphoreEXT(semaphore))
+	GLImportedSemaphore imported{};
+	glGenSemaphoresEXT(1, &imported.Semaphore);
+	auto semaphoreHandle = client->DuplicateHandle(handle).value_or(0);
+	glImportSemaphore(imported.Semaphore, GL_HANDLE_TYPE, semaphoreHandle);
+	if (glGetError() != GL_NO_ERROR || !glIsSemaphoreEXT(imported.Semaphore))
 	{
 		std::cerr << "Failed to import semaphore" << std::endl;
-		glDeleteSemaphoresEXT(1, &semaphore);
-		return 0;
+		return std::nullopt;
 	}
-	return semaphore;
+	return imported;
 }
 
 void UpdateSyncState(nos::app::ExecutionState newState);
@@ -326,8 +347,8 @@ struct ExternalTexture
 
 struct NodosState
 {
-	GLuint InputSemaphore = 0, OutputSemaphore = 0;
-	HANDLE RenderSubmittedEvent = 0;
+	std::optional<GLImportedSemaphore> InputSemaphore = {std::nullopt}, OutputSemaphore = {std::nullopt};
+	std::optional<ImportedOSHandle> RenderSubmittedEvent = std::nullopt;
 	ExternalTexture ShaderInput{}, ShaderOutput{};
 	nos::app::ExecutionState ExecutionState = nos::app::ExecutionState::IDLE;
 	nos::app::ExecutionState ExecutionStateMainThread = nos::app::ExecutionState::IDLE;
@@ -346,9 +367,6 @@ struct GLData
 	GLuint VBO;
 	GLuint FBO;
 } glData;
-
-nos::app::IAppServiceClient* client;
-struct SampleEventDelegates* eventDelegates;
 
 struct TaskQueue
 {
@@ -446,7 +464,6 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 		NodeId = *appNode.id();
 
 		CreateTexturePinsInNodos(appNode);
-
 	}
 
 	void OnNodeImported(nos::fb::Node const& appNode)
@@ -482,15 +499,20 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 				if (pinId == g_NodosState.ShaderInput.Id || pinId == g_NodosState.ShaderOutput.Id)
 				{
 					auto imported = ImportTexture(tex);
+					if(!imported)
+					{
+						std::cerr << "Failed to import texture" << std::endl;
+						return;
+					}
 					if (pinId == g_NodosState.ShaderInput.Id)
 					{
 						g_NodosState.ShaderInput.Texture = tex;
-						g_NodosState.ShaderInput.Image = imported;
+						g_NodosState.ShaderInput.Image = std::move(*imported);
 					}
 					else if (pinId == g_NodosState.ShaderOutput.Id)
 					{
 						g_NodosState.ShaderOutput.Texture = tex;
-						g_NodosState.ShaderOutput.Image = imported;
+						g_NodosState.ShaderOutput.Image = std::move(*imported);
 						glNamedFramebufferTexture(glData.FBO, GL_COLOR_ATTACHMENT0, g_NodosState.ShaderOutput.Image.Image, 0);
 					}
 				}
@@ -547,7 +569,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 				DeleteSyncSemaphores();
 				g_NodosState.InputSemaphore = ImportSemaphore(pid, inputSemaphoreHandle);
 				g_NodosState.OutputSemaphore = ImportSemaphore(pid, outputSemaphoreHandle);
-				g_NodosState.RenderSubmittedEvent = PlatformDupeHandle(pid, (HANDLE)renderSubmittedEvent);
+				g_NodosState.RenderSubmittedEvent = {renderSubmittedEvent};
 			});
 	}
 };
@@ -640,7 +662,8 @@ bool InitWindow()
 #else
 #error Unsupported platform
 #endif
-	glfwSwapInterval(0);
+	
+	glfwSwapInterval(1);
 	return true;
 }
 
@@ -759,13 +782,24 @@ int InitNosSDK()
 	nos::app::FN_MakeAppServiceClient* pfnMakeAppServiceClient = nullptr;
 	nos::app::FN_ShutdownClient* pfnShutdownClient = nullptr;
 
+
+#if defined(_WIN32)
 	HMODULE sdkModule = LoadLibrary(NODOS_APP_SDK_DLL);
 	if (sdkModule) {
 		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)GetProcAddress(sdkModule, "CheckSDKCompatibility");
 		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)GetProcAddress(sdkModule, "MakeAppServiceClient");
 		pfnShutdownClient = (nos::app::FN_ShutdownClient*)GetProcAddress(sdkModule, "ShutdownClient");
 	}
-	else {
+#elif defined(__linux__)
+	std::cout << "Nodos app SDK path: " << NODOS_APP_SDK_DLL << std::endl;
+	void* sdkModule = dlopen(NODOS_APP_SDK_DLL, RTLD_LAZY);
+	if (sdkModule) {
+		pfnCheckSDKCompatibility = (nos::app::FN_CheckSDKCompatibility*)dlsym(sdkModule, "CheckSDKCompatibility");
+		pfnMakeAppServiceClient = (nos::app::FN_MakeAppServiceClient*)dlsym(sdkModule, "MakeAppServiceClient");
+		pfnShutdownClient = (nos::app::FN_ShutdownClient*)dlsym(sdkModule, "ShutdownClient");
+	}
+#endif
+	if (!sdkModule) {
 		std::cerr << "Failed to load Nodos SDK" << std::endl;
 		return -1;
 	}
@@ -798,6 +832,7 @@ int InitNosSDK()
 		std::cout << "Connecting to Nodos..." << std::endl;
 		std::this_thread::sleep_for(std::chrono::seconds(1));
 	}
+	return 0;
 }
 
 void CreateTexturePinsInNodos(const nos::fb::Node& appNode)
@@ -833,6 +868,10 @@ void CreateTexturePinsInNodos(const nos::fb::Node& appNode)
 
 void UpdateSyncState(nos::app::ExecutionState newState)
 {
+	TaskQueue.Push([newState]()
+	{
+		glfwSwapInterval(newState == nos::app::ExecutionState::IDLE ? 1 : 0);
+	});
 	std::unique_lock<std::mutex> lock(g_NodosState.ExecutionStateMutex);
 	g_NodosState.ExecutionState = newState;
 	g_NodosState.ExecutionStateCV.notify_all();
@@ -840,21 +879,22 @@ void UpdateSyncState(nos::app::ExecutionState newState)
 
 void DeleteSyncSemaphores()
 {
-	if (g_NodosState.InputSemaphore)
-	{
-		glDeleteSemaphoresEXT(1, &g_NodosState.InputSemaphore);
-		g_NodosState.InputSemaphore = 0;
-	}
-	if (g_NodosState.OutputSemaphore)
-	{
-		glDeleteSemaphoresEXT(1, &g_NodosState.OutputSemaphore);
-		g_NodosState.OutputSemaphore = 0;
-	}
+	g_NodosState.InputSemaphore = std::nullopt;
+	g_NodosState.OutputSemaphore = std::nullopt;
 	if (g_NodosState.RenderSubmittedEvent)
 	{
-		SetEvent(g_NodosState.RenderSubmittedEvent);
-		CloseHandle(g_NodosState.RenderSubmittedEvent);
-		g_NodosState.RenderSubmittedEvent = 0;
+		if(g_NodosState.RenderSubmittedEvent)
+		{
+#if defined(_WIN32)
+			SetEvent(g_NodosState.RenderSubmittedEvent);
+#elif defined(__linux__)
+			uint64_t dummy = 1;
+			write(*g_NodosState.RenderSubmittedEvent->OSHandle, &dummy, sizeof(dummy));
+#else 
+#error Unsupported platform
+#endif
+		}
+		g_NodosState.RenderSubmittedEvent = std::nullopt;
 	}
 	g_NodosState.CurFrameNumber = 0;
 }
@@ -885,16 +925,11 @@ int main()
 {
 	InitWindow();
 	InitOpenGL();
-	InitNosSDK();
-
-
-	GLuint testTexture;
-	glCreateTextures(GL_TEXTURE_2D, 1, &testTexture);
-	glTextureStorage2D(testTexture, 1, GL_RGBA16F, 1920, 1080);
-	glTextureParameteri(testTexture, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTextureParameteri(testTexture, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTextureParameteri(testTexture, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTextureParameteri(testTexture, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	if(InitNosSDK())
+	{
+		std::cerr << "Failed to initialize Nodos SDK" << std::endl;
+		return -1;
+	}
 
 	int frame = 0;
 	while (!glfwWindowShouldClose(window)) {
@@ -912,7 +947,7 @@ int main()
 		glClearColor(0.0f, 0.3f, 0.3f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
 		bool areTexturesReady = g_NodosState.ShaderInput.Image.Image && g_NodosState.ShaderOutput.Image.Image;
-		bool areSemaphoresReady = g_NodosState.InputSemaphore && g_NodosState.OutputSemaphore;
+		bool areSemaphoresReady = g_NodosState.InputSemaphore && g_NodosState.OutputSemaphore && g_NodosState.RenderSubmittedEvent;
 		if (g_NodosState.ExecutionStateMainThread == nos::app::ExecutionState::SYNCED && areTexturesReady && areSemaphoresReady)
 		{
 			bool isIdle = false;
@@ -932,7 +967,7 @@ int main()
 				{
 					GLenum srcLayout = GL_LAYOUT_TRANSFER_DST_EXT;
 					//std::cout << "Waiting for input semaphore" << std::endl;
-					glWaitSemaphoreEXT(g_NodosState.InputSemaphore, 0, nullptr, 1, &g_NodosState.ShaderInput.Image.Image, &srcLayout);
+					glWaitSemaphoreEXT(g_NodosState.InputSemaphore->Semaphore, 0, nullptr, 1, &g_NodosState.ShaderInput.Image.Image, &srcLayout);
 					glFlush();
 					if (glGetError() != GL_NO_ERROR)
 					{
@@ -954,9 +989,17 @@ int main()
 				//signal output semaphore
 				{
 					GLenum dstLayouts = GL_LAYOUT_TRANSFER_SRC_EXT;
-					glSignalSemaphoreEXT(g_NodosState.OutputSemaphore, 0, nullptr, 1, &g_NodosState.ShaderOutput.Image.Image, &dstLayouts);
+					glSignalSemaphoreEXT(g_NodosState.OutputSemaphore->Semaphore, 0, nullptr, 1, &g_NodosState.ShaderOutput.Image.Image, &dstLayouts);
 					glFlush();
+
+#if defined(_WIN32)
 					SetEvent(g_NodosState.RenderSubmittedEvent);
+#elif defined(__linux__)
+					uint64_t dummy = 1;
+					write(*g_NodosState.RenderSubmittedEvent, &dummy, sizeof(dummy));
+#else
+#error Unsupported platform
+#endif
 				}
 				glClipControl(GL_LOWER_LEFT, GL_NEGATIVE_ONE_TO_ONE);
 				//render to screen
