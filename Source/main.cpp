@@ -72,7 +72,7 @@ struct ImportedOSHandle
 
 	operator NOS_HANDLE() const
 	{
-		return OSHandle.value_or(0);
+		return OSHandle.value_or(NOS_HANDLE(0));
 	}
 };
 
@@ -301,13 +301,13 @@ std::optional<GLImportedTexture> ImportTexture(nos::sys::vulkan::TTexture const&
 		std::cerr << "Failed to create memory object" << std::endl;
 		return std::nullopt;
 	}
-	auto handle = ImportedOSHandle(tex.external_memory.handle());
+	auto handle = ImportedOSHandle((NOS_HANDLE)tex.external_memory.handle());
 	if(!handle.OSHandle)
 	{
 		std::cerr << "Failed to duplicate handle" << std::endl;
 		return std::nullopt;
 	}
-	glImportMemory(imported.Memory, tex.external_memory.allocation_size(), GL_HANDLE_TYPE, handle.OSHandle.value_or(0));
+	glImportMemory(imported.Memory, tex.external_memory.allocation_size(), GL_HANDLE_TYPE, *handle.OSHandle);
 	glCreateTextures(GL_TEXTURE_2D, 1, &imported.Image);
 	auto format = VulkanToOpenGLFormat(tex.format);
 	assert(format != GL_NONE);
@@ -324,7 +324,7 @@ std::optional<GLImportedSemaphore> ImportSemaphore(uint64_t pid, uint64_t handle
 {
 	GLImportedSemaphore imported{};
 	glGenSemaphoresEXT(1, &imported.Semaphore);
-	auto semaphoreHandle = client->DuplicateHandle(handle).value_or(0);
+	auto semaphoreHandle = client->DuplicateHandle((NOS_HANDLE)handle).value_or(NOS_HANDLE(0));
 	glImportSemaphore(imported.Semaphore, GL_HANDLE_TYPE, semaphoreHandle);
 	if (glGetError() != GL_NO_ERROR || !glIsSemaphoreEXT(imported.Semaphore))
 	{
@@ -569,7 +569,7 @@ struct SampleEventDelegates : nos::app::IEventDelegates
 				DeleteSyncSemaphores();
 				g_NodosState.InputSemaphore = ImportSemaphore(pid, inputSemaphoreHandle);
 				g_NodosState.OutputSemaphore = ImportSemaphore(pid, outputSemaphoreHandle);
-				g_NodosState.RenderSubmittedEvent = {renderSubmittedEvent};
+				g_NodosState.RenderSubmittedEvent = ImportedOSHandle((NOS_HANDLE)renderSubmittedEvent);
 			});
 	}
 };
@@ -883,10 +883,10 @@ void DeleteSyncSemaphores()
 	g_NodosState.OutputSemaphore = std::nullopt;
 	if (g_NodosState.RenderSubmittedEvent)
 	{
-		if(g_NodosState.RenderSubmittedEvent)
+		if(g_NodosState.RenderSubmittedEvent->OSHandle)
 		{
 #if defined(_WIN32)
-			SetEvent(g_NodosState.RenderSubmittedEvent);
+			SetEvent(*g_NodosState.RenderSubmittedEvent->OSHandle);
 #elif defined(__linux__)
 			uint64_t dummy = 1;
 			write(*g_NodosState.RenderSubmittedEvent->OSHandle, &dummy, sizeof(dummy));
@@ -993,7 +993,7 @@ int main()
 					glFlush();
 
 #if defined(_WIN32)
-					SetEvent(g_NodosState.RenderSubmittedEvent);
+					SetEvent(*g_NodosState.RenderSubmittedEvent);
 #elif defined(__linux__)
 					uint64_t dummy = 1;
 					write(*g_NodosState.RenderSubmittedEvent, &dummy, sizeof(dummy));
