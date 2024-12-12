@@ -1007,6 +1007,8 @@ int main()
 				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 				glBlitFramebuffer(0, 0, g_NodosState.ShaderOutput.Texture.width, g_NodosState.ShaderOutput.Texture.height, 0, 0, WIDTH, HEIGHT, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
+				flatbuffers::FlatBufferBuilder fbb;
+				client->Send(nos::CreateAppEvent(fbb, nos::app::CreateExecutionCompletedDirect(fbb, &eventDelegates->NodeId, g_NodosState.CurFrameNumber)));
 				g_NodosState.CurFrameNumber++;
 			}
 		}
